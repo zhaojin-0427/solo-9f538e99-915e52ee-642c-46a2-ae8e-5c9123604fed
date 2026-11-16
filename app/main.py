@@ -7,11 +7,13 @@ from contextlib import asynccontextmanager
 
 from fastapi import FastAPI, File, Form, Header, Query, UploadFile
 from fastapi.responses import JSONResponse, Response
+from starlette.concurrency import run_in_threadpool
 
 from . import storage
 from .db import init_db
 from .errors import ApiError
-from .models import (CheckAck, InstanceOut, PackageOut, ReportList, ReportOut)
+from .models import (CheckAck, InstanceOut, InstanceRevisionOut, PackageOut,
+                     ReportList, ReportOut)
 
 
 @asynccontextmanager
@@ -88,14 +90,27 @@ async def create_instance(package_id: str, instance: UploadFile = File(...)):
 
 @app.post("/instances/{instance_id}/revisions", response_model=InstanceOut,
           tags=["instances"],
-          summary="更正实例；Expected-Package-Revision 过期则 412")
+          summary="更正实例；两个 Expected 修订任一过期或处理期间变化则 412")
 async def revise_instance(
     instance_id: str,
-    instance: UploadFile = File(...),
-    expected_package_revision: int = Header(..., alias="Expected-Package-Revision"),
+    instance: UploadFile = File(..., description="更正后的 XBRL 实例"),
+    expected_instance_revision: int = Header(
+        ..., alias="Expected-Instance-Revision",
+        description="提交者所见实例修订；非当前最新版则 412",
+    ),
+    expected_package_revision: int = Header(
+        ..., alias="Expected-Package-Revision",
+        description="提交者所见关系包修订；用于解析并记入新修订，非当前最新版则 412",
+    ),
 ):
-    return storage.revise_instance(
-        instance_id, expected_package_revision, await instance.read()
+    # Parse + compare + write is blocking; run it in the threadpool so two
+    # concurrent corrections really do race (and one is rejected).
+    return await run_in_threadpool(
+        storage.revise_instance,
+        instance_id,
+        expected_instance_revision,
+        expected_package_revision,
+        await instance.read(),
     )
 
 
@@ -107,6 +122,26 @@ def list_instances(package_id: Optional[str] = Query(None)):
 @app.get("/instances/{instance_id}", response_model=InstanceOut, tags=["instances"])
 def get_instance(instance_id: str):
     return storage.get_instance(instance_id)
+
+
+@app.get("/instances/{instance_id}/revisions", response_model=list[InstanceRevisionOut],
+         tags=["instances"],
+         summary="全部实例修订；legacy 修订的 package_revision 为 null")
+def list_instance_revisions(instance_id: str):
+    return storage.list_instance_revisions(instance_id)
+
+
+@app.get("/instances/{instance_id}/revisions/{revision}",
+         response_model=InstanceRevisionOut, tags=["instances"])
+def get_instance_revision(instance_id: str, revision: int):
+    return storage.get_instance_revision(instance_id, revision)
+
+
+@app.get("/instances/{instance_id}/revisions/{revision}/raw", tags=["instances"],
+         summary="下载某版实例原始 XML")
+def get_instance_revision_raw(instance_id: str, revision: int):
+    data, media = storage.get_instance_revision_raw(instance_id, revision)
+    return Response(content=data, media_type=media)
 
 
 # ------------------------------------------------------------- checks / reports

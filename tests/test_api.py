@@ -97,7 +97,8 @@ def test_stale_instance_revision_and_correction_flow(client, samples):
     # correction: instance revision 2 (package still rev 1)
     r = client.post(
         f"/instances/{inst['instance_id']}/revisions",
-        headers={"Expected-Package-Revision": "1"},
+        headers={"Expected-Instance-Revision": "1",
+                 "Expected-Package-Revision": "1"},
         files={"instance": ("i.xml", samples["feasible"], "application/xml")},
     )
     assert r.status_code == 200, r.text
@@ -106,7 +107,8 @@ def test_stale_instance_revision_and_correction_flow(client, samples):
     # instance correction against stale package rev is rejected
     r = client.post(
         f"/instances/{inst['instance_id']}/revisions",
-        headers={"Expected-Package-Revision": "5"},
+        headers={"Expected-Instance-Revision": "2",
+                 "Expected-Package-Revision": "5"},
         files={"instance": ("i.xml", samples["feasible"], "application/xml")},
     )
     assert r.status_code == 412
@@ -140,7 +142,8 @@ def test_late_report_kept_as_history_only(client, samples):
     # correction to rev 2 then a fresh feasible report
     client.post(
         f"/instances/{inst['instance_id']}/revisions",
-        headers={"Expected-Package-Revision": "1"},
+        headers={"Expected-Instance-Revision": "1",
+                 "Expected-Package-Revision": "1"},
         files={"instance": ("i.xml", samples["feasible"], "application/xml")},
     )
     current = check(client, inst["instance_id"], 2, 1).json()["report"]

@@ -1,4 +1,16 @@
-"""Service / persistence operations with optimistic revision checks."""
+"""Service / persistence operations with optimistic revision checks.
+
+Revision-safe writes follow the same shape everywhere:
+
+1. read the revisions the caller says it observed;
+2. parse/validate the new payload against those exact, immutable revisions;
+3. open a short write transaction that re-reads ``latest_rev`` and refuses to
+   write when either side moved in the meantime (HTTP 412).
+
+Step 3 is what stops two operators who both started from the same base from
+each appending a revision derived from it: the first commits, the second sees
+the new revision and is rejected without touching any stored row.
+"""
 from __future__ import annotations
 
 import json
@@ -20,13 +32,18 @@ def _new_id(prefix: str) -> str:
     return f"{prefix}_{uuid.uuid4().hex[:16]}"
 
 
+def _stale(what: str, expected: int, actual: int) -> StaleRevision:
+    return StaleRevision(
+        f"expected {what} revision {expected}, server has {actual}"
+    )
+
+
 # ---------------------------------------------------------------- packages
 def create_package(name: str, xsd: bytes, calc: bytes) -> dict:
     info = parse_package(xsd, calc)
-    conn = db.get_conn()
     pid = _new_id("pkg")
     now = _now()
-    with conn:
+    with db.transaction() as conn:
         conn.execute(
             "INSERT INTO packages(id, name, latest_rev, created_at, updated_at) "
             "VALUES (?,?,1,?,?)",
@@ -48,21 +65,29 @@ def revise_package(pid: str, expected_revision: int, xsd: bytes, calc: bytes) ->
     if row is None:
         raise NotFound(f"package '{pid}' not found")
     if row["latest_rev"] != expected_revision:
-        raise StaleRevision(
-            f"expected package revision {expected_revision}, server has {row['latest_rev']}"
-        )
+        raise _stale("package", expected_revision, row["latest_rev"])
+
     info = parse_package(xsd, calc)
     new_rev = expected_revision + 1
     now = _now()
-    with conn:
-        conn.execute(
+    with db.transaction() as tx:
+        # Re-read inside the write transaction: the package may have been
+        # revised while the new XSD/linkbase was being parsed.
+        current = tx.execute(
+            "SELECT latest_rev FROM packages WHERE id=?", (pid,)
+        ).fetchone()
+        if current is None:
+            raise NotFound(f"package '{pid}' not found")
+        if current["latest_rev"] != expected_revision:
+            raise _stale("package", expected_revision, current["latest_rev"])
+        tx.execute(
             "INSERT INTO package_revisions(package_id, revision, xsd_raw, calc_raw, "
             "target_ns, prefix, concepts_json, equations_json, created_at) "
             "VALUES (?,?,?,?,?,?,?,?,?)",
             (pid, new_rev, xsd, calc, info["target_ns"], info["prefix"],
              json.dumps(info["concepts"]), json.dumps(info["equations"]), now),
         )
-        conn.execute(
+        tx.execute(
             "UPDATE packages SET latest_rev=?, updated_at=? WHERE id=?",
             (new_rev, now, pid),
         )
@@ -77,6 +102,15 @@ def _package_revision_row(pid: str, revision: int) -> dict:
     if row is None:
         raise NotFound(f"package '{pid}' revision {revision} not found")
     return dict(row)
+
+
+def _package_info(rev: dict) -> dict:
+    """The parsed shape consumed by ``parse_instance`` for one revision."""
+    return {
+        "target_ns": rev["target_ns"],
+        "prefix": rev["prefix"],
+        "concepts": json.loads(rev["concepts_json"]),
+    }
 
 
 def get_package(pid: str) -> dict:
@@ -111,52 +145,102 @@ def list_packages() -> list[dict]:
 # ---------------------------------------------------------------- instances
 def create_instance(pid: str, raw: bytes) -> dict:
     conn = db.get_conn()
-    if conn.execute("SELECT 1 FROM packages WHERE id=?", (pid,)).fetchone() is None:
+    pkg_row = conn.execute("SELECT latest_rev FROM packages WHERE id=?", (pid,)).fetchone()
+    if pkg_row is None:
         raise NotFound(f"package '{pid}' not found")
-    pkg = get_package(pid)
-    info = parse_instance(raw, pkg["latest"])
+    pkg_revision = pkg_row["latest_rev"]
+
+    # Parse against this exact package revision; record it as the factual basis.
+    p_rev = _package_revision_row(pid, pkg_revision)
+    info = parse_instance(raw, _package_info(p_rev))
     iid = _new_id("inst")
     now = _now()
-    with conn:
-        conn.execute(
+    with db.transaction() as tx:
+        if tx.execute("SELECT 1 FROM packages WHERE id=?", (pid,)).fetchone() is None:
+            raise NotFound(f"package '{pid}' not found")
+        # If the package was revised while the instance was parsed, parse again
+        # against the now-current revision so the stored facts and the recorded
+        # basis never describe the same bytes under two different packages.
+        latest = tx.execute(
+            "SELECT latest_rev FROM packages WHERE id=?", (pid,)
+        ).fetchone()["latest_rev"]
+        if latest != pkg_revision:
+            pkg_revision = latest
+            fresh = tx.execute(
+                "SELECT * FROM package_revisions WHERE package_id=? AND revision=?",
+                (pid, pkg_revision),
+            ).fetchone()
+            info = parse_instance(raw, _package_info(dict(fresh)))
+        tx.execute(
             "INSERT INTO instances(id, package_id, latest_rev, created_at, updated_at) "
             "VALUES (?,?,1,?,?)",
             (iid, pid, now, now),
         )
-        conn.execute(
+        tx.execute(
             "INSERT INTO instance_revisions(instance_id, revision, instance_raw, entity, "
-            "period, currency, facts_json, created_at) VALUES (?,?,?,?,?,?,?,?)",
+            "period, currency, facts_json, package_revision, created_at) "
+            "VALUES (?,?,?,?,?,?,?,?,?)",
             (iid, 1, raw, info["entity"], info["period"], info["currency"],
-             json.dumps(info["facts"]), now),
+             json.dumps(info["facts"]), pkg_revision, now),
         )
     return get_instance(iid)
 
 
-def revise_instance(iid: str, expected_package_revision: int, raw: bytes) -> dict:
+def revise_instance(iid: str, expected_instance_revision: int,
+                    expected_package_revision: int, raw: bytes) -> dict:
     conn = db.get_conn()
     row = conn.execute(
         "SELECT package_id, latest_rev FROM instances WHERE id=?", (iid,)
     ).fetchone()
     if row is None:
         raise NotFound(f"instance '{iid}' not found")
-    pkg = get_package(row["package_id"])
-    # 受理时校验两侧所见修订：实例提交必须针对当前 package 修订。
-    if pkg["latest_revision"] != expected_package_revision:
-        raise StaleRevision(
-            f"expected package revision {expected_package_revision}, "
-            f"server has {pkg['latest_revision']}"
-        )
-    info = parse_instance(raw, pkg["latest"])
-    new_rev = row["latest_rev"] + 1
+
+    pid = row["package_id"]
+    pkg_row = conn.execute("SELECT latest_rev FROM packages WHERE id=?", (pid,)).fetchone()
+    if pkg_row is None:  # pragma: no cover - foreign key guarantees it
+        raise NotFound(f"package '{pid}' not found")
+
+    # Both revisions the operator saw must still be current.  This includes
+    # the instance revision: two corrections based on the same old instance
+    # must not both be accepted.
+    if row["latest_rev"] != expected_instance_revision:
+        raise _stale("instance", expected_instance_revision, row["latest_rev"])
+    if pkg_row["latest_rev"] != expected_package_revision:
+        raise _stale("package", expected_package_revision, pkg_row["latest_rev"])
+
+    # Parse with the package revision the operator observed, not whatever may
+    # become latest while we parse.  The transaction below rejects the write
+    # if either revision moved in the meantime.
+    p_rev = _package_revision_row(pid, expected_package_revision)
+    info = parse_instance(raw, _package_info(p_rev))
+
+    new_rev = expected_instance_revision + 1
     now = _now()
-    with conn:
-        conn.execute(
+    with db.transaction() as tx:
+        current = tx.execute(
+            "SELECT package_id, latest_rev FROM instances WHERE id=?", (iid,)
+        ).fetchone()
+        if current is None:
+            raise NotFound(f"instance '{iid}' not found")
+        if current["package_id"] != pid:
+            raise NotFound(f"instance '{iid}' not found")
+        current_pkg = tx.execute(
+            "SELECT latest_rev FROM packages WHERE id=?", (pid,)
+        ).fetchone()
+        if current["latest_rev"] != expected_instance_revision:
+            raise _stale("instance", expected_instance_revision, current["latest_rev"])
+        if current_pkg is None or current_pkg["latest_rev"] != expected_package_revision:
+            actual = current_pkg["latest_rev"] if current_pkg is not None else -1
+            raise _stale("package", expected_package_revision, actual)
+
+        tx.execute(
             "INSERT INTO instance_revisions(instance_id, revision, instance_raw, entity, "
-            "period, currency, facts_json, created_at) VALUES (?,?,?,?,?,?,?,?)",
+            "period, currency, facts_json, package_revision, created_at) "
+            "VALUES (?,?,?,?,?,?,?,?,?)",
             (iid, new_rev, raw, info["entity"], info["period"], info["currency"],
-             json.dumps(info["facts"]), now),
+             json.dumps(info["facts"]), expected_package_revision, now),
         )
-        conn.execute(
+        tx.execute(
             "UPDATE instances SET latest_rev=?, updated_at=? WHERE id=?",
             (new_rev, now, iid),
         )
@@ -173,6 +257,22 @@ def _instance_revision_row(iid: str, revision: int) -> dict:
     return dict(row)
 
 
+def _instance_revision_out(iid: str, package_id: str, rev: dict) -> dict:
+    return {
+        "instance_id": iid,
+        "package_id": package_id,
+        "revision": rev["revision"],
+        "entity": rev["entity"],
+        "period": rev["period"],
+        "currency": rev["currency"],
+        "facts": json.loads(rev["facts_json"]),
+        # NULL means this revision predates basis tracking.  We deliberately
+        # do not infer a package revision for it.
+        "package_revision": rev["package_revision"],
+        "created_at": rev["created_at"],
+    }
+
+
 def get_instance(iid: str) -> dict:
     conn = db.get_conn()
     row = conn.execute("SELECT * FROM instances WHERE id=?", (iid,)).fetchone()
@@ -185,17 +285,34 @@ def get_instance(iid: str) -> dict:
         "latest_revision": row["latest_rev"],
         "created_at": row["created_at"],
         "updated_at": row["updated_at"],
-        "latest": {
-            "instance_id": iid,
-            "package_id": row["package_id"],
-            "revision": rev["revision"],
-            "entity": rev["entity"],
-            "period": rev["period"],
-            "currency": rev["currency"],
-            "facts": json.loads(rev["facts_json"]),
-            "created_at": rev["created_at"],
-        },
+        "latest": _instance_revision_out(iid, row["package_id"], rev),
     }
+
+
+def list_instance_revisions(iid: str) -> list[dict]:
+    conn = db.get_conn()
+    row = conn.execute("SELECT package_id FROM instances WHERE id=?", (iid,)).fetchone()
+    if row is None:
+        raise NotFound(f"instance '{iid}' not found")
+    rows = conn.execute(
+        "SELECT * FROM instance_revisions WHERE instance_id=? ORDER BY revision",
+        (iid,),
+    ).fetchall()
+    return [_instance_revision_out(iid, row["package_id"], dict(r)) for r in rows]
+
+
+def get_instance_revision(iid: str, revision: int) -> dict:
+    conn = db.get_conn()
+    row = conn.execute("SELECT package_id FROM instances WHERE id=?", (iid,)).fetchone()
+    if row is None:
+        raise NotFound(f"instance '{iid}' not found")
+    rev = _instance_revision_row(iid, revision)
+    return _instance_revision_out(iid, row["package_id"], rev)
+
+
+def get_instance_revision_raw(iid: str, revision: int) -> tuple[bytes, str]:
+    rev = _instance_revision_row(iid, revision)
+    return bytes(rev["instance_raw"]), "application/xml"
 
 
 def list_instances(pid: str | None = None) -> list[dict]:
@@ -217,6 +334,9 @@ def _report_out(row: dict) -> dict:
         "package_id": row["package_id"],
         "instance_revision": row["instance_revision"],
         "package_revision": row["package_revision"],
+        # Package revision used to parse the instance facts behind this
+        # report.  NULL for legacy instance revisions whose basis is unknown.
+        "instance_package_revision": row["instance_package_revision"],
         "status": row["status"],
         "is_correction": bool(row["is_correction"]),
         "superseded": bool(row["superseded"]),
@@ -276,17 +396,19 @@ def run_check(iid: str, expected_instance_revision: int,
 
     now = _now()
     report_id = _new_id("rpt")
-    prior = conn.execute(
-        "SELECT id FROM reports WHERE instance_id=? ORDER BY created_at, rowid", (iid,)
-    ).fetchall()
-    is_correction = len(prior) > 0
-
+    basis = i_rev["package_revision"]
     detail = {
         "entity": i_rev["entity"],
         "period": i_rev["period"],
         "currency": i_rev["currency"],
         "fact_count": len(facts),
         "equation_count": len(equations),
+        "instance_package_revision": basis,
+        # True when the stored facts were parsed under a different package
+        # revision than the one whose equations are being checked, or when
+        # that basis is unknown (legacy revision, basis is null).
+        "package_basis_differs": basis != p_rev["revision"],
+        "package_basis_unknown": basis is None,
         "solver": "scipy.optimize.linprog(highs)",
     }
     payload = {
@@ -295,9 +417,8 @@ def run_check(iid: str, expected_instance_revision: int,
         "package_id": inst_row["package_id"],
         "instance_revision": i_rev["revision"],
         "package_revision": p_rev["revision"],
+        "instance_package_revision": i_rev["package_revision"],
         "status": result["status"],
-        "is_correction": 1 if is_correction else 0,
-        "late": 1 if is_late else 0,
         "witness_json": json.dumps(result["witness"]) if "witness" in result else None,
         "conflicts_json": json.dumps(result["conflicts"]) if "conflicts" in result else None,
         "missing_json": json.dumps(result["missing_facts"]) if "missing_facts" in result else None,
@@ -309,24 +430,56 @@ def run_check(iid: str, expected_instance_revision: int,
     }
 
     superseded_ids: list[str] = []
-    with conn:
-        conn.execute(
+    with db.transaction() as tx:
+        # The solver may take a while.  For a current check, both revisions
+        # must still be current when the report is written; otherwise the
+        # report would silently describe a state the caller no longer saw.
+        current_inst = tx.execute(
+            "SELECT package_id, latest_rev FROM instances WHERE id=?", (iid,)
+        ).fetchone()
+        if current_inst is None:
+            raise NotFound(f"instance '{iid}' not found")
+        current_pkg = tx.execute(
+            "SELECT latest_rev FROM packages WHERE id=?", (inst_row["package_id"],)
+        ).fetchone()
+        if not is_late and (
+            current_inst["latest_rev"] != expected_instance_revision
+            or current_pkg is None
+            or current_pkg["latest_rev"] != expected_package_revision
+        ):
+            actual_inst = current_inst["latest_rev"]
+            actual_pkg = current_pkg["latest_rev"] if current_pkg is not None else -1
+            raise StaleRevision(
+                f"revisions changed while the check was being processed; "
+                f"expected ({expected_instance_revision},{expected_package_revision}), "
+                f"server has ({actual_inst},{actual_pkg})"
+            )
+
+        prior = tx.execute(
+            "SELECT id FROM reports WHERE instance_id=? ORDER BY created_at, rowid", (iid,)
+        ).fetchall()
+        is_correction = len(prior) > 0
+        payload["is_correction"] = 1 if is_correction else 0
+        payload["late"] = 1 if is_late else 0
+
+        tx.execute(
             "INSERT INTO reports(id, instance_id, package_id, instance_revision, "
-            "package_revision, status, is_correction, superseded, late, witness_json, "
-            "conflicts_json, missing_json, detail_json, instance_snapshot, xsd_snapshot, "
-            "calc_snapshot, created_at) VALUES (:id,:instance_id,:package_id,"
-            ":instance_revision,:package_revision,:status,:is_correction,0,:late,"
-            ":witness_json,:conflicts_json,:missing_json,:detail_json,:instance_snapshot,"
+            "package_revision, instance_package_revision, status, is_correction, "
+            "superseded, late, witness_json, conflicts_json, missing_json, detail_json, "
+            "instance_snapshot, xsd_snapshot, calc_snapshot, created_at) VALUES "
+            "(:id,:instance_id,:package_id,:instance_revision,:package_revision,"
+            ":instance_package_revision,:status,:is_correction,0,:late,:witness_json,"
+            ":conflicts_json,:missing_json,:detail_json,:instance_snapshot,"
             ":xsd_snapshot,:calc_snapshot,:created_at)",
             payload,
         )
         if not is_late:
-            old = conn.execute(
+            old = tx.execute(
                 "SELECT id FROM reports WHERE instance_id=? AND id!=? AND superseded=0",
                 (iid, report_id),
             ).fetchall()
             superseded_ids = [r["id"] for r in old]
-            conn.execute(
+            tx.execute(
                 "UPDATE reports SET superseded=1 WHERE instance_id=? AND id!=?",
                 (iid, report_id),
             )

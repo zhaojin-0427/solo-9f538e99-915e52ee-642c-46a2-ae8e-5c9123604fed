@@ -58,6 +58,9 @@ class InstanceRevisionOut(BaseModel):
     period: str
     currency: str
     facts: list[Fact]
+    # Package revision actually used to parse these facts.  ``None`` for
+    # revisions stored before the basis was recorded; never inferred.
+    package_revision: Optional[int] = None
     created_at: str
 
 
@@ -91,6 +94,10 @@ class ReportOut(BaseModel):
     package_id: str
     instance_revision: int
     package_revision: int
+    # Package revision used to parse the instance facts (the factual basis of
+    # the stored facts).  May differ from ``package_revision`` when a late
+    # report checks an old instance revision against a newer linkbase.
+    instance_package_revision: Optional[int] = None
     status: Literal["feasible", "infeasible", "pending"]
     is_correction: bool
     superseded: bool
